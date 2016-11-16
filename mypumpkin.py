@@ -1,358 +1,328 @@
+#!/usr/bin/python
 #coding:utf-8
+
 import sys, os
-#from multiprocessing import Queue, Process
 from Queue import Queue
 import time
 import subprocess
 import MySQLdb
 from threading import Thread
 from collections import defaultdict
+# import argparse
+from argparse import ArgumentParser
+from multiprocessing import cpu_count
 
-"""
-不改变使用习惯，2点：
-    1. 务必带上密码
-    2. --result-file
-       --result-dir
-       >加上转义符号 \>  或者指定--outfile
-    3. --tables
-
---abc=#     必须=
---abc[=#]   可以不用=，若=必须=
---abc=name
-"""
-
-queue_out = Queue()
-queue_in = Queue()
 MYCMD_NEW = []  # handled mysqldump/load
+MYQUEUE = Queue()
 
 
-class MyLoad(object):
-    def __init__(self, myload_cmd):
+class NewOptions(object):
+    def __init__(self, mycmd):
         global MYCMD_NEW
+        self.mycmd = mycmd
 
-        self.myload_cmd = myload_cmd  # not change
-        MYCMD_NEW = list(myload_cmd)
-        self.dump_dir = self.handle_myload_options()
-        self.queue_in = self.queue_myload_tables(myload_cmd)
+        work_mode = ''
+        try:
+            if mycmd[1] == 'mysqldump':
+                work_mode = 'DUMP'
+            elif mycmd[1] == 'mysql':
+                work_mode = 'LOAD'
+            else:
+                print "Only mysqldump or mysql allowed after mypumpkin.py\n"
+                # myparser will do the next
+        except IndexError:
+            pass
+            #help_parser = self.parse_myopt()
+            #ArgumentParser.error(help_parser, help_parser.print_help())
 
-    def handle_myload_options(self):
-        dump_dir = ""
-        for myopt in self.myload_cmd:
-            if myopt.startswith("--dump-dir="):
-                dump_dir = myopt.split("=")[1]
-                MYCMD_NEW.remove(myopt)
-            elif myopt == "--database" or myopt.startswith("--database="):
-                print "you should NOT specify --database option, --databases instead"
-                sys.exit(-1)
+        myparser = self.parse_myopt(work_mode)
 
-                # pos_databases = myload_cmd.index(dir_res_may)
+        self.myopts, MYCMD_NEW = myparser.parse_known_args(mycmd)
+        print "myparse options handling tables&dbs: ", self.myopts
 
+        self.threads = self.myopts.threads[0]
+        self.dumpdir = self.get_dumpdir(work_mode)
+
+    def get_dumpdir(self, work_mode):
+        dump_dir = self.myopts.dump_dir[0]
         if dump_dir == "":
-            print "You must specifiy --dump-dir=xxx. (not support '<')"
+            print "You must specifiy --dump-dir=xxx. (not support '>')"
             sys.exit(-1)
         elif not os.path.exists(dump_dir):
-            print "The specified dump-dir %s does not exist, the program will try to create it for you." % dump_dir
-            sys.exit(-1)
-
+            if work_mode == 'DUMP':
+                print "The specified dump-dir %s does not exist, the program will try to create it for you." % dump_dir
+                try:
+                    os.makedirs(dump_dir)
+                except:
+                    print "创建目录 %s 失败" % dump_dir
+                    sys.exit(-1)
+            elif work_mode == 'LOAD':
+                print "The specified dump-dir %s does not exist"
+                sys.exit(-1)
         return dump_dir
 
-    def handle_tables_options(self, *myload_cmd):
-        """
-        --databases db1 db2
-        --databases db1 --tables t1 t2
-        --databases db1 db2 --ignore-tables db1.t1 db2.t2
-        --all-databases [default]
-        """
-        myload_cmd = myload_cmd[0]
-        print "handle_tables_options - myload_cmd: ", myload_cmd
+    def parse_myopt(self, work_mode=''):
+        parser = ArgumentParser(description="This's a program that wrap mysqldump/mysql to make them dump-out/load-in concurrently.\n"
+                                            "Attention: it can not keep consistent for whole database(s).",
+                                add_help=False,
+                                usage='%(prog)s {mysqldump|mysqls} [--help]',
+                                epilog="At least one of these 3 group options given: [-A,-B] [--tables] [--ignore-table]")  # , allow_abbrev=False)
+        group1 = parser.add_mutually_exclusive_group()
+        group2 = parser.add_mutually_exclusive_group()
+        # group_dbinfo = parser.add_argument_group('db connect info')
 
-        list_databases = []
-        opt_databases = "--databases"
-        if opt_databases in myload_cmd:
-            pos_databases = myload_cmd.index(opt_databases)
-            pos_databases_next = pos_databases + 1
-            for db in myload_cmd[pos_databases_next:]:
-                if not db.startswith("-"):
-                    list_databases.append(db)
-                    MYCMD_NEW.remove(db)
-                else:
+        num_threads = cpu_count() * 2
+        if work_mode == 'DUMP':
+            num_threads = 2
+
+        # parser.add_argument('mysql_cmd', choices=['mysqldump', 'mysql'])
+        parser.add_argument('--help', action='help', help='show this help message and exit')
+
+        group1.add_argument('-B', '--databases', nargs='+', metavar='db1', help='Dump one or more databases')
+        group1.add_argument('-A', '--all-databases', action='store_true', help='Dump all databases')
+        group2.add_argument('--tables', nargs='+', metavar='t1',
+                            help='Specifiy tables to dump. Override --databases (-B)')
+        group2.add_argument('--ignore-table', nargs='+', metavar='db1.table1', action='append',
+                            help='Do not dump the specified table. (format like --ignore-table=dbname.tablename). '
+                                 'Use the directive multiple times for more than one table to ignore.')
+        parser.add_argument('--threads', nargs=1, metavar='=N', default=[num_threads], type=int, help='Threads to dump out [2], or load in [CPUs*2].')
+        parser.add_argument('--dump-dir', nargs=1, required=True, action='store', help='Required. Directory to dump out (create if not exist), Or Where to load in sqlfile')
+
+        # print parser.parse_args(mydump_cmd[2:])
+        return parser  # .parse_args()
+
+    def get_tables_opt(self):
+        global MYCMD_NEW
+
+        print "Start to handle your table relevant options..."
+        opt_dbs = self.myopts.databases
+        opt_is_alldbs = self.myopts.all_databases
+        opt_tables = self.myopts.tables
+        opt_ignores = self.myopts.ignore_table
+
+        len_dbs = [len(opt_dbs) if opt_dbs is not None else 0][0]
+        len_alldbs = [1 if opt_is_alldbs else 0][0]
+        len_tables = [len(opt_tables) if opt_tables is not None else 0][0]
+        len_ignores = [len(opt_ignores) if opt_ignores is not None else 0][0]
+
+
+        """ 5种情形
+        1. -B db1 db2  或者 -A
+        2. -B db1 --table t1 t2
+        3. -B db1 db2 --ignore-table db1.t1 db1.t2 --ignore-table db2.t1 db2.t2  或者 -A --ignore...
+        4. db1 --ignore-table=db1.t1 --ignore-table=db1.t2
+        5. db1 --tables t1 t2
+
+        db1 t1 t2  not support
+        db1 not support
+        --tables与-B与--ignore-table必出现其一
+        --tables与--ignore-table只能出现其一
+        -A,-B只能出现其一
+        --tables, --ignore-table 必紧跟隐式db之后
+        """
+
+        if len_tables + len_ignores + len_dbs + len_alldbs == 0:
+            print "Error: at least one of [--tables, --ignore-table, -B, -A] is specified!"
+            sys.exit(-1)
+
+        tables_handler = []  # --tables, --ignore-table, --B d1 d2    dbname.*
+        dbname_list = []
+        tables_tag = 'db-include'  # ignore-table  databases  all-databases
+
+        if (len_alldbs > 0 or len_dbs > 1) and len_tables > 0:
+            print "Error: --tables only be specified with one databases"
+            sys.exit(-1)
+        elif len_dbs + len_alldbs == 0:  # 情形4和5，没有显示指定db
+            for table_opt in self.mycmd:
+                if table_opt.startswith('--tables') or table_opt.startswith('--ignore-table'):
+                    pos_table_opt = self.mycmd.index(table_opt)
+                    pos_dbname = pos_table_opt - 1
+                    dbname = self.mycmd[pos_dbname]
+
+                    if dbname.startswith('-'):
+                        print "Error: Please give the right database name"
+                        sys.exit(-1)
+                    else:
+                        dbname_list = [dbname]
+                        MYCMD_NEW.remove(dbname)
+
                     break
-            if len(list_databases) == 0:
-                print "Please give correct database name after --databases "
-                sys.exit(-1)
-            MYCMD_NEW.remove(opt_databases)
         else:
-            list_databases = ""  # --all-databases
-        print type(list_databases), list_databases
+            # tables_tag = 'include'
+            if opt_dbs is not None:
+                dbname_list = opt_dbs
+            elif opt_is_alldbs:
+                dbname_list = []
+            else:
+                print "no right databases given. this should never be print"
+        print "mypumpkin>> This is the databases detected: ", dbname_list
 
-        opt_tables = "--tables"
-        opt_ignore = "--ignore-tables"
-        cnt_db = len(list_databases)
+        if opt_tables is not None:  # 情景5，2
+            for tab in opt_tables:
+                tables_handler.append(dbname_list[0] + "." + tab)
+            tables_tag = 'include-tab'
+        elif opt_ignores is not None:  # 情景4，3
+            for tabs in opt_ignores:
+                for db_tab in tabs:
+                    tables_handler.append(db_tab)
+            tables_tag = 'db-exclude'
+        print "mypumpkin>> This is the tables (%s) detected: %s" %(tables_tag, tables_handler)
 
-        if opt_tables in myload_cmd and cnt_db > 1:
-            print "Only one database allowed when --tables given"
-            sys.exit(-1)
-        if opt_ignore in myload_cmd and opt_tables in myload_cmd:
-            print "Error: you should NOT specifiy --ignore-tables and --tables both"
-            sys.exit(-1)
+        MYCMD_NEW = MYCMD_NEW[1:]  # 去掉外包装
+        # print "MYCMD_NEW ready:", MYCMD_NEW
+        return dbname_list, tables_handler, tables_tag
 
-        dict_tables_os = defaultdict(list)
-        for dirName, subdirList, fileList in os.walk(self.dump_dir):
+
+class MyLoad(NewOptions):
+
+    def handle_tables_options(self):
+        dbname_list, tables_list, tables_tag = self.get_tables_opt()
+
+        all_tables_os = defaultdict(list)
+        for dirName, subdirList, fileList in os.walk(self.dumpdir):
             for fname in fileList:
                 fname_list = fname.split(".")
                 if fname_list[-1] == "sql":
                     schema_name, table_name = fname_list[0], fname_list[1]
-                    #schema_table_name = schema_name + "." + table_name
-                    dict_tables_os[schema_name].append(fname)
-        print "dict_table_os: ", dict_tables_os
+                    all_tables_os[schema_name].append(table_name)
+        # print "all_tables_os: ", all_tables_os
 
-        set_db_notdump = set(list_databases) - set(dict_tables_os.keys())
-        if len(set_db_notdump) > 0:
-            print "You have specified database that have not been dumped: ", set_db_notdump
-            sys.exit(-1)
-        else:
-            if list_databases == "":
-                list_databases = dict_tables_os.keys()  # all databases dumped
-            set_db_notload = set(dict_tables_os.keys()) - set(list_databases)
-            print "os list: ", dict_tables_os.keys(), list_databases
-            for db in set_db_notload:
-                del dict_tables_os[db]
-            print "dict_table_os after databases: ", dict_tables_os
-
-        if opt_ignore in myload_cmd:
-            pos_ignore = myload_cmd.index(opt_ignore)
-            pos_ignore_next = pos_ignore + 1
-            for ignore_table in myload_cmd[pos_ignore_next:]:
-                if not ignore_table.startswith("-"):
-                    try:
-                        db_name, tb_name = ignore_table.split(".")
-                    except ValueError, e:
-                        print "ignore-tables must be specified like dbname.tablename"
-                        sys.exit(-1)
-                    try:
-                        dict_tables_os[db_name].remove(ignore_table + ".sql")  # table not dumped exeption
-                    except ValueError, e:
-                        print "Table %s dump file can not be reached." % ignore_table
-                        sys.exit(-1)
-                    MYCMD_NEW.remove(ignore_table)
+        if tables_tag == 'include-tab':  # [-B] db1 --table t1
+            all_tables = defaultdict(list)
+            for st_name in tables_list:
+                db_name, tb_name = st_name.split(".")
+                if tb_name in all_tables_os[db_name]:
+                    all_tables[db_name].append(tb_name)
                 else:
-                    break
-            MYCMD_NEW.remove(opt_ignore)
-            print "dict_table_os after ignored: ", dict_tables_os
-
-        elif opt_tables in myload_cmd and cnt_db == 1:
-            include_db = list_databases[0]
-            pos_tables = myload_cmd.index(opt_tables)
-            pos_tables_next = pos_tables + 1
-            list_include_tables = []
-            for include_table in myload_cmd[pos_tables_next:]:
-                if not include_table.startswith("-"):
-                    schema_table_sql = "%s.%s.sql" % (include_db, include_table)
-                    list_include_tables.append(schema_table_sql)
-                    MYCMD_NEW.remove(include_table)
-                else:
-                    break
-            MYCMD_NEW.remove(opt_tables)
-
-            for tab in list_include_tables:
-                if tab not in dict_tables_os[include_db]:
-                    print "You have specified table that have not been dumped: ", tab
+                    print "Error: can not find dumped file for table [%s]" % st_name
                     sys.exit(-1)
-            dict_tables_os.clear()
-            dict_tables_os[include_db] = list_include_tables  # rewrite include tables to list_os
-            print "dict_table_os after tabled: ", dict_tables_os
+            all_tables_os = all_tables  # include
+        elif tables_tag.startswith('db-'):  # -B db1 db2 (-A)
+            # all_tables = self.get_tables_from_db()  # 从db里面获取所有表
+            if len(dbname_list) != 0:  # not -A
+                set_db_notexist = set(dbname_list) - set(all_tables_os.keys())
+                if set_db_notexist:
+                    print "Error: Db [%s] do not dumped" % ",".join(set_db_notexist)
+                    sys.exit(-1)
+                for db_l in all_tables_os.keys():
+                    if db_l not in dbname_list:
+                        del all_tables_os[db_l]  # 删除不在-B指定的db
 
-        # else just --databases or nothing
-        print "handled table options: MYCMD_NEW: ",MYCMD_NEW
-        return dict_tables_os
+            if tables_tag == 'db-exclude':  # db1 --ignore-table db1.t1,  -B db1 [db2] --ignore-table (-A)
+                for st_name in tables_list:
+                    db_name, tb_name = st_name.split(".")
+                    try:
+                        all_tables_os[db_name].remove(tb_name)
+                    except ValueError:
+                        print "Error: can not get ignored table [%s] from dumped directory [%s] " % (st_name, self.dumpdir)
+                        sys.exit(-1)
 
-    def queue_myload_tables(self, *myload_cmd):
-        # myload_cmd_new = list(self.myload_cmd)
-        myload_cmd = myload_cmd[0]
-        print "queue_myload_tables - myload_cmd: ", myload_cmd
-        tab_file_queue = Queue()
+        return all_tables_os
 
-        # process --databases --tables --ignore-table= option
-        tables_dict = self.handle_tables_options(myload_cmd)
-        print "table_dict: ", tables_dict
+    def queue_myload_tables(self):
+        global MYQUEUE
+
+        tables_dict = self.handle_tables_options()
+        # print "Tables to load: ", tables_dict
 
         for db, tabs in tables_dict.items():
             for tab in tabs:
-                tab_file_queue.put(tab)
+                MYQUEUE.put("{0}.{1}".format(db, tab))
 
-        print "tables dict queue done"
-        return tab_file_queue
+        print "mypumpkin>> tables waiting to load in have queued"
 
     # load one table from dumpdir into database
     # get sql file list from queue_in
     # def load_in(self):
     def do_process(self):
+        global MYQUEUE
         while True:
-            if not self.queue_in.empty():
-                in_table = self.queue_in.get(block=False)
+            if not MYQUEUE.empty():
+                in_table = MYQUEUE.get(block=False)
                 in_table_list = in_table.split(".")
                 schema_name, table_name = in_table_list[0], in_table_list[1]
 
-                load_option = " --database %s < %s/%s" % (schema_name, self.dump_dir, in_table)
+                load_option = " --database %s < %s/%s.sql" % (schema_name, self.dumpdir, in_table)
                 myload_cmd_run = " ".join(MYCMD_NEW) + load_option
-                print "myload_cmd_run: ", myload_cmd_run
-                # subprocess.call(myload_cmd_run, shell=True)
-                time.sleep(1)
+                try:
+                    print "mypumpkin>> Loading in table [%s]: " % in_table
+                    print "  " + myload_cmd_run
+                    subprocess.check_output(myload_cmd_run, shell=True)  # , stderr=subprocess.STDOUT)
+                    # 进程的输出，包括warning和错误，都打印出来
+                except subprocess.CalledProcessError as e:
+                    print "Error shell returncode %d: exit \n" % e.returncode
+                    sys.exit(-1)
+                time.sleep(0.3)
             else:
-                print "load over"
+                print "mypumpkin>> databases and tables load thread finished"
                 break
 
 
-class MyDump(object):
-    def __init__(self, mydump_cmd):
-        global MYCMD_NEW
+class MyDump(NewOptions):
+
+    def handle_tables_options(self):
+        dbname_list, tables_list, tables_tag = self.get_tables_opt()
+
+        all_tables = defaultdict(list)
+        if tables_tag == 'include-tab':  # [-B] db1 --table t1
+            for st_name in tables_list:
+                db_name, tb_name = st_name.split(".")
+                all_tables[db_name].append(tb_name)
+        elif tables_tag.startswith('db-'):  # -B db1 db2 (-A)
+            all_tables = self.get_tables_from_db()  # 从db里面获取所有表
+            if len(dbname_list) != 0:  # not -A
+                set_db_notexist = set(dbname_list) - set(all_tables.keys())
+                if set_db_notexist:
+                    print "Error: Db [%s] do not exist" % ",".join(set_db_notexist)
+                    sys.exit(-1)
+                for db_l in all_tables.keys():
+                    if db_l not in dbname_list:
+                        del all_tables[db_l]
+
+            if tables_tag == 'db-exclude':  # db1 --ignore-table db1.t1,  -B db1 [db2] --ignore-table (-A)
+                for st_name in tables_list:
+                    db_name, tb_name = st_name.split(".")
+                    try:
+                        all_tables[db_name].remove(tb_name)
+                    except ValueError:
+                        print "Table %s does not exist (or not in -B databases)." % st_name
+                        sys.exit(-1)
+
+        return all_tables
+
+    def queue_mydump_tables(self):
         global MYQUEUE
 
-        self.mydump_cmd = mydump_cmd  # not change
-        MYCMD_NEW = list(mydump_cmd)
-        self.dump_dir = self.handle_mydump_options()
-        MYQUEUE = self.queue_mydump_tables(mydump_cmd)
-
-    def handle_mydump_options(self):
-        dump_dir = ""
-        for myopt in self.mydump_cmd:
-            if myopt.startswith("--dump-dir="):
-                dump_dir = myopt.split("=")[1]
-                MYCMD_NEW.remove(myopt)
-                # pos_databases = myload_cmd.index(dir_res_may)
-
-        if dump_dir == "":
-            print "You must specifiy --dump-dir=xxx. (not support '>')"
-            sys.exit(-1)
-        elif not os.path.exists(dump_dir):
-            print "The specified dump-dir %s does not exist, the program will try to create it for you." % dump_dir
-            try:
-                os.makedirs(dump_dir)
-            except:
-                print "创建目录 %s 失败" % dump_dir
-                sys.exit(-1)
-
-        return dump_dir
-
-    def handle_tables_options(self, *mydump_cmd):
-        print type(mydump_cmd), mydump_cmd
-        mydump_cmd = mydump_cmd[0]
-
-        opt_tables = "--tables"
-        opt_databases = "-B"
-        opt_ignore = "--ignore-table="
-        db_tables = defaultdict(list)
-
-        if opt_tables in mydump_cmd:
-            pos_tables = mydump_cmd.index(opt_tables)
-            dbname = mydump_cmd[pos_tables - 1]
-            print "--tables pos: ", pos_tables
-            print "database: ", dbname
-            print "table names:"
-
-            pos_tables_next = pos_tables + 1
-            list_tables = []
-            # while pos_tables_next < len(MYCMD_NEW):
-            for tab in mydump_cmd[pos_tables_next:]:
-                if not tab.startswith("-"):
-                    print tab
-                    list_tables.append(tab)
-                    MYCMD_NEW.remove(tab)
-                    #pos_tables_next += 1
-                else:
-                    break
-
-            MYCMD_NEW.remove(dbname)
-            MYCMD_NEW.remove(opt_tables)
-            print "MYCMD_NEW_handled:", MYCMD_NEW
-
-            db_tables[dbname] = list_tables
-
-        else:
-            db_tables = self.get_tables_from_db()
-
-            if opt_databases in mydump_cmd:
-                pos_databases = mydump_cmd.index(opt_databases)
-                pos_databases_next = pos_databases + 1
-                list_databases = []
-                #while pos_databases_next < len(MYCMD_NEW):  # len change
-                for db in mydump_cmd[pos_databases_next:]:
-                    # db = MYCMD_NEW[pos_databases_next]
-                    if not db.startswith("-"):
-                        list_databases.append(db)
-                        MYCMD_NEW.remove(db)
-                    else:
-                        break
-                MYCMD_NEW.remove(opt_databases)
-            else:
-                list_databases = ""
-            print "list_database from args", type(list_databases), list_databases
-
-            set_db_notdump = set(list_databases) - set(db_tables.keys())
-            if len(set_db_notdump) > 0:
-                print "You have specified database that do not exist: ", set_db_notdump
-                sys.exit(-1)
-            else:
-                if list_databases == "":
-                    list_databases = db_tables.keys()  # all databases dumped
-                set_db_notload = set(db_tables.keys()) - set(list_databases)
-                print "os list: ", db_tables.keys(), list_databases
-                for db in set_db_notload:
-                    del db_tables[db]
-                print "dict_table_os after databases: ", db_tables
-
-            #if opt_ignore in mydump_cmd:
-            #    pos_ignore = mydump_cmd.index(opt_ignore)
-                #pos_ignore_next = pos_ignore + 1
-            for ignore_table in mydump_cmd:
-                if ignore_table.startswith(opt_ignore):
-
-                    try:
-                        db_name, tb_name = ignore_table.split("=")[1].split(".")
-                    except ValueError:
-                        print "ignore-tables must be specified like dbname.tablename"
-                        sys.exit(-1)
-                    try:
-                        db_tables[db_name].remove(tb_name)  # table not dumped exeption
-                        MYCMD_NEW.remove(ignore_table)
-                    except ValueError:
-                        print "Table %s does not exist." % ignore_table
-                        sys.exit(-1)
-
-                # MYCMD_NEW.remove(opt_ignore)
-
-        print "MYCMD_NEW_handled - database :", MYCMD_NEW
-        print "final tables to dump:", db_tables
-
-        return db_tables
-            # print "queue_out qsize ", queue_out.qsize()
-
-    def queue_mydump_tables(self, *mydump_cmd):
-        mydump_cmd = mydump_cmd[0]
-        print "queue_mydump_tables - mydump_cmd: ", mydump_cmd
-        tab_file_queue = Queue()
-
-        # process --databases --tables --ignore-table= option
-        tables_dict = self.handle_tables_options(mydump_cmd)
+        tables_dict = self.handle_tables_options()
         # print "table_dict: ", tables_dict
 
         for db, tabs in tables_dict.items():
             for tab in tabs:
-                tab_file_queue.put("{0}.{1}".format(db, tab))
+                MYQUEUE.put("{0}.{1}".format(db, tab))
 
-        print "tables dict queue done"
-        return tab_file_queue
+        print "mypumpkin>> tables waiting to dump out have queued"
 
     def get_tables_from_db(self):
-        dbinfo = self.get_conninfo_from_cmd()
-        print "dbinfo:", dbinfo
-        conn = MySQLdb.Connect(host=dbinfo[0], user=dbinfo[1], passwd=dbinfo[2], port=dbinfo[3], connect_timeout=5)
-        cur = conn.cursor()
+        print "Go for target db to get all tables list..."
 
-        sqlstr = "select table_schema, table_name from information_schema.tables where TABLE_TYPE = 'BASE TABLE' AND " \
-                 "TABLE_SCHEMA not in('information_schema', 'performance_schema', 'sys')"
-        print "get tables:", sqlstr
-        cur.execute(sqlstr)
+        dbinfo = self.get_dbinfo_cmd()
+
+        try:
+            if dbinfo[4] is not None:  # socket given
+                conn = MySQLdb.Connect(host=dbinfo[0], user=dbinfo[1], passwd=dbinfo[2], port=dbinfo[3],
+                                       unix_socket=dbinfo[4], connect_timeout=5)
+            else:
+                conn = MySQLdb.Connect(host=dbinfo[0], user=dbinfo[1], passwd=dbinfo[2], port=dbinfo[3], connect_timeout=5)
+            cur = conn.cursor()
+
+            sqlstr = "select table_schema, table_name from information_schema.tables where TABLE_TYPE = 'BASE TABLE' AND " \
+                     "TABLE_SCHEMA not in('information_schema', 'performance_schema', 'sys')"
+            # print "get tables:", sqlstr
+            cur.execute(sqlstr)
+        except MySQLdb.Error, e:
+            print "Error mysql %d: %s" % (e.args[0], e.args[1])
+            sys.exit(-1)
+
         res = cur.fetchall()
         cur.close()
         conn.close()
@@ -364,44 +334,24 @@ class MyDump(object):
         # print "db all tables: ", dict_tables_db
         return dict_tables_db
 
-    def get_conninfo_from_cmd(self):
-        db_host = ""
-        db_user = ""
-        db_pass = ""
-        db_port = 0
+    def get_dbinfo_cmd(self):
+        parser = ArgumentParser(description="Process some args", conflict_handler='resolve')
 
-        mydump_cmd = self.mydump_cmd
+        parser.add_argument('-h', '--host', nargs=1, metavar='host1', help='Host to connect')
+        parser.add_argument('-u', '--user', nargs=1, metavar='user1', help='User to connect')
+        parser.add_argument('-p', '--password', nargs=1, metavar='yourpassword', help='Password for user1 to connect')
+        parser.add_argument('-P', '--port', nargs=1, metavar='port', type=int, default=3306, help='Port for host to connect')
+        parser.add_argument('-S', '--socket', nargs=1, metavar='socket', help='Socket address for host to connect')
 
-        for db_args in mydump_cmd:
-            if db_args.startswith("-h"):
-                db_host_idx = mydump_cmd.index(db_args)
-                if db_args == "-h":
-                    db_host = mydump_cmd[db_host_idx + 1]
-                else:
-                    db_host = mydump_cmd[db_host_idx][2:]
-            elif db_args.startswith("-u"):
-                db_user_idx = mydump_cmd.index(db_args)
-                if db_args == "-u":
-                    db_user = mydump_cmd[db_user_idx + 1]
-                else:
-                    db_user = mydump_cmd[db_user_idx][2:]
-            elif db_args.startswith("-p"):
-                db_pass_idx = mydump_cmd.index(db_args)
-                db_pass = mydump_cmd[db_pass_idx][2:]
-            elif db_args.startswith("-P"):
-                print "db_port, args", db_args
-                db_port_idx = mydump_cmd.index(db_args)
-                db_port = int(mydump_cmd[db_port_idx][2:])
+        dbinfo_opt, _ = parser.parse_known_args(self.mycmd)
 
-            if db_host != "" and db_user != "" and db_pass != "" and db_port != 0:
-                break
+        db_host = dbinfo_opt.host[0]
+        db_user = dbinfo_opt.user[0]
+        db_pass = dbinfo_opt.password[0]
+        db_port = dbinfo_opt.port[0]
+        db_sock = dbinfo_opt.socket
 
-        if db_host == "" or db_user == "" or db_pass == "":
-            print "wrong db connect info given"
-            sys.exit(-1)
-        elif db_port == 0:
-            db_port = 3306
-        return db_host, db_user, db_pass, db_port
+        return db_host, db_user, db_pass, db_port, db_sock
 
     # def dump_out(self):
     def do_process(self):
@@ -413,13 +363,20 @@ class MyDump(object):
                 schema_name, table_name = in_table_list[0], in_table_list[1]
 
                 dump_option = " %s --tables %s --result-file=%s/%s.sql" \
-                              % (schema_name, table_name, self.dump_dir, in_table)
+                              % (schema_name, table_name, self.dumpdir, in_table)
                 mydump_cmd_run = " ".join(MYCMD_NEW) + dump_option
-                print "mydump_cmd_run: ", mydump_cmd_run
-                # subprocess.call(mydump_cmd_run, shell=True)
-                time.sleep(1)
+
+                try:
+                    print "mypumpkin>> Dumping out table [%s]: " % in_table
+                    print "  " + mydump_cmd_run
+                    subprocess.check_output(mydump_cmd_run, shell=True)  # , stderr=subprocess.STDOUT)
+                    # 进程的输出，包括warning和错误，都打印出来
+                except subprocess.CalledProcessError as e:
+                    print "Error shell returncode %d: exit \n" % e.returncode
+                    sys.exit(-1)
+                time.sleep(0.3)
             else:
-                print "dump over"
+                print "mypumpkin>> databases and tables dump thread finished"
                 break
 
 
@@ -433,44 +390,46 @@ class myThread(Thread):
         self.myprocess.do_process()
 
 
-MYQUEUE = Queue()
-
 if __name__ == '__main__':
-    global MYQUEUE
-    #python mysql_mload.py mysqldump -uecuser -p strongpassword -P3306 -h 10.0.200.195 -B d_ec_crm t1 t2
+    #python mypumpkin.py mysqldump -uecuser -p strongpassword -P3306 -h 10.0.200.195 -B d_ec_crm t1 t2
 
-    myload_cmd = ['mysql_mload.py', 'mysql', '-h', '10.0.200.195', '-u', 'ecuser', '-pecuser', '-P3307', '--default-character-set=utf8mb4',
-              # '--databases', 'd_ec_crm',  'd_ec_crmextend',
-              '--ignore-tables', 'd_ec_crm.t_eccrm_detail',  # 'd_ec_crm.t_crm_contact_at201610',  # 'd_ec.t_eccrm_detail',
+    myload_cmd = ['mypumpkin.py', 'mysql', '-h', '10.0.200.195', '-u', 'ecuser', '-pecuser', '-P3307', '--default-character-set=utf8mb4',
+              '--databases', 'd_ec_crm',  'd_ec_crmextend',  # '--tables', 't2',
+              '--ignore-table', 'd_ec_crm.t_eccrm_detail',  # 'd_ec_crm.t_crm_contact_at201610',  # 'd_ec.t_eccrm_detail',
               '--dump-dir=dumpdir']
-    """
-    mydump_cmd = ['mysql_mload.py', 'mysqldump', '-h', '192.168.1.125', '-u', 'ecuser', '-pecuser', '-P3308',
-                     '--single-transaction', '--no-set-names', '--skip-add-locks', '-e', '-q', '-t', '-n', '--skip-triggers', '--no-autocommit', '--max-allowed-packet=134217728', '--net-buffer-length=1638400',
-                     '--hex-blob', '--default-character-set=latin1', '--dump-dir=dumpdir',
-                     'd_ec_crm0', '--tables', 't_crm_qq_record_201612', 't_crm_qq_record_201611', 't_crm_qq_record_201610', 't_crm_qq_record_201609',
-                     't_crm_qq_record_201608', 't_crm_qq_record_201607', 't_crm_qq_record_201606', 't_crm_qq_record_201509', 't_crm_qq_record_201610']
-                     # '-B', "d_ec_crm0", "d_ec_crm1", "--ignore-table=d_ec_crm0.t_crm_qq_record_201612",
-                     # '--ignore-table=d_ec_crm1.t_crm_qq_record_201611']
-    """
-    mycmd_wrap = myload_cmd # sys.argv
-    mycmd = mycmd_wrap[1:]
-    dump_load = mycmd_wrap[1]
 
-    print mycmd
+    mydump_cmd = ['mypumpkin.py', 'mysqldump', '-h', '192.168.1.125', '-u', 'ecuser', '-pecuser', '-P3308',
+                     '--single-transaction', '--no-set-names', '--skip-add-locks', '-e', '-q', '-t', '-n', '--skip-triggers', '--no-autocommit', '--max-allowed-packet=134217728', '--net-buffer-length=1638400',
+                     '--hex-blob', '--default-character-set=latin1', '--dump-dir=dumpdir',  #'--ignore-table', 'dd',
+                     '-B', 'd_ec_crm0' , # 'd_ec_crm1',
+                     '--tables', 't_crm_qq_record_201612', 't_crm_qq_record_201611', 't_crm_qq_record_201610', 't_crm_qq_record_201609',
+                     # 't_crm_qq_record_201608', 't_crm_qq_record_201607', 't_crm_qq_record_201606', 't_crm_qq_record_201509', 't_crm_qq_record_201610'
+                     ]
+                     # '-B', "d_ec_crm0", "d_ec_crm1", "--ignore-table=d_ec_crm0.t_crm_qq_record_201612",
+                     # '--ignore-table=d_ec_crm1.t_crm_qq_record_201611', '--ignore-table=d_ec_crm1.t_crm_qq_record_201610', '--ignore-table=d_ec_crm1.t_crm_qq_record_201608',
+                     # '--ignore-table', 'd_ec_crm0.t_crm_qq_record_201611', 'd_ec_crm0.t_crm_qq_record_201607']
+
+    mycmd = sys.argv
+    my_process = NewOptions(mycmd)  # just for args check
+    my_process = None
+
+    # print mycmd
     # my_process = None
-    if dump_load == 'mysqldump':
+    if mycmd[1] == 'mysqldump':
         my_process = MyDump(mycmd)
-    elif dump_load == 'mysql':
+        my_process.queue_mydump_tables()
+    elif mycmd[1] == 'mysql':
         my_process = MyLoad(mycmd)
+        my_process.queue_myload_tables()
     else:
-        print "mysqldump / mysql"
+        print "Only mysqldump or mysql allowed after mypumpkin.py\n"  # should never print
         sys.exit(-1)
 
-    # myqueue = Queue()
-    # mydump = MyDump(mydump_cmd[1:])
-    # MYQUEUE = mydump.queue_mydump_tables(mydump_cmd)
+    num_threads = my_process.threads
 
-    for i in range(2):
+    print "mypumpkin>> number of threads: ", num_threads
+    for i in range(num_threads):
         worker = myThread(my_process)
         # worker.setDaemon(True)
         worker.start()
+        time.sleep(0.5)
