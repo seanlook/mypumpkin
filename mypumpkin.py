@@ -1,6 +1,10 @@
 #!/usr/bin/python
 #coding:utf-8
-
+"""
+Author:     seanlook
+Contact:    seanlook7@gmail http://seanlook.com
+Date:       2016-11-02 released
+"""
 import sys, os
 from Queue import Queue
 import time
@@ -16,11 +20,17 @@ MYCMD_NEW = []  # handled mysqldump/load
 MYQUEUE = Queue()
 
 
+"""
+选项解析的父类
+MYCMD_NEW 是处理选项后留下的部分，会与与后续处理表名组合起来
+mycmd 是mysqldump或mysql完整的命令行参数
+"""#
 class NewOptions(object):
     def __init__(self, mycmd):
         global MYCMD_NEW
         self.mycmd = mycmd
 
+        # 判断紧跟的命令是否合法
         work_mode = ''
         try:
             if mycmd[1] == 'mysqldump':
@@ -43,6 +53,7 @@ class NewOptions(object):
         self.threads = self.myopts.threads[0]
         self.dumpdir = self.get_dumpdir(work_mode)
 
+    # 获取dumpout或loadin时指定的目录
     def get_dumpdir(self, work_mode):
         dump_dir = self.myopts.dump_dir[0]
         if dump_dir == "":
@@ -61,6 +72,7 @@ class NewOptions(object):
                 sys.exit(-1)
         return dump_dir
 
+    # 定义参数解析对象并返回该对象，init方法里使用它解析命令行
     def parse_myopt(self, work_mode=''):
         parser = ArgumentParser(description="This's a program that wrap mysqldump/mysql to make them dump-out/load-in concurrently.\n"
                                             "Attention: it can not keep consistent for whole database(s).",
@@ -69,12 +81,11 @@ class NewOptions(object):
                                 epilog="At least one of these 3 group options given: [-A,-B] [--tables] [--ignore-table]")  # , allow_abbrev=False)
         group1 = parser.add_mutually_exclusive_group()
         group2 = parser.add_mutually_exclusive_group()
-        # group_dbinfo = parser.add_argument_group('db connect info')
 
+        # 默认load并发线程数是cpu核数的2倍，dump默认是2
         num_threads = cpu_count() * 2
         if work_mode == 'DUMP':
             num_threads = 2
-
         # parser.add_argument('mysql_cmd', choices=['mysqldump', 'mysql'])
         parser.add_argument('--help', action='help', help='show this help message and exit')
 
@@ -91,6 +102,11 @@ class NewOptions(object):
         # print parser.parse_args(mydump_cmd[2:])
         return parser  # .parse_args()
 
+    """
+    分析-A,-B,--tables,--ignore-table
+    返回命令行解析出来的，要处理的db([]表示没有-A,-B)，要处理的table(tables_tag表示是include还是ignore)
+    该方法在子类中才调用
+    """
     def get_tables_opt(self):
         global MYCMD_NEW
 
@@ -104,7 +120,6 @@ class NewOptions(object):
         len_alldbs = [1 if opt_is_alldbs else 0][0]
         len_tables = [len(opt_tables) if opt_tables is not None else 0][0]
         len_ignores = [len(opt_ignores) if opt_ignores is not None else 0][0]
-
 
         """ 5种情形
         1. -B db1 db2  或者 -A
@@ -172,12 +187,13 @@ class NewOptions(object):
         # print "MYCMD_NEW ready:", MYCMD_NEW
         return dbname_list, tables_handler, tables_tag
 
-
+# 使用mysql去load in，继承自NewOptions
 class MyLoad(NewOptions):
-
+    # 调用父类get_tables_opt，查找dumpdir里面已有的sqlfile，以获得最终需要导入的表（字典）
     def handle_tables_options(self):
         dbname_list, tables_list, tables_tag = self.get_tables_opt()
 
+        # all_tables_os是操作系统上dumpdir找到的所有db和表
         all_tables_os = defaultdict(list)
         for dirName, subdirList, fileList in os.walk(self.dumpdir):
             for fname in fileList:
@@ -219,6 +235,7 @@ class MyLoad(NewOptions):
 
         return all_tables_os
 
+    # 将 handle_tables_options 的结果放入全局队列
     def queue_myload_tables(self):
         global MYQUEUE
 
@@ -231,9 +248,10 @@ class MyLoad(NewOptions):
 
         print "mypumpkin>> tables waiting to load in have queued"
 
-    # load one table from dumpdir into database
-    # get sql file list from queue_in
-    # def load_in(self):
+    """
+    从队列取出表名，在os上启动一个进行进行load in
+    多线程里循环调用该方法
+    """
     def do_process(self):
         global MYQUEUE
         while True:
@@ -256,7 +274,6 @@ class MyLoad(NewOptions):
             else:
                 print "mypumpkin>> databases and tables load thread finished"
                 break
-
 
 class MyDump(NewOptions):
 
@@ -302,6 +319,7 @@ class MyDump(NewOptions):
 
         print "mypumpkin>> tables waiting to dump out have queued"
 
+    # 导出指了DB时，需要从源库information_schema里面找到表名
     def get_tables_from_db(self):
         print "Go for target db to get all tables list..."
 
@@ -334,6 +352,7 @@ class MyDump(NewOptions):
         # print "db all tables: ", dict_tables_db
         return dict_tables_db
 
+    # 被上面的get_tables_from_db调用，单独解析登录信息
     def get_dbinfo_cmd(self):
         parser = ArgumentParser(description="Process some args", conflict_handler='resolve')
 
@@ -391,29 +410,10 @@ class myThread(Thread):
 
 
 if __name__ == '__main__':
-    #python mypumpkin.py mysqldump -uecuser -p strongpassword -P3306 -h 10.0.200.195 -B d_ec_crm t1 t2
-
-    myload_cmd = ['mypumpkin.py', 'mysql', '-h', '10.0.200.195', '-u', 'ecuser', '-pecuser', '-P3307', '--default-character-set=utf8mb4',
-              '--databases', 'd_ec_crm',  'd_ec_crmextend',  # '--tables', 't2',
-              '--ignore-table', 'd_ec_crm.t_eccrm_detail',  # 'd_ec_crm.t_crm_contact_at201610',  # 'd_ec.t_eccrm_detail',
-              '--dump-dir=dumpdir']
-
-    mydump_cmd = ['mypumpkin.py', 'mysqldump', '-h', '192.168.1.125', '-u', 'ecuser', '-pecuser', '-P3308',
-                     '--single-transaction', '--no-set-names', '--skip-add-locks', '-e', '-q', '-t', '-n', '--skip-triggers', '--no-autocommit', '--max-allowed-packet=134217728', '--net-buffer-length=1638400',
-                     '--hex-blob', '--default-character-set=latin1', '--dump-dir=dumpdir',  #'--ignore-table', 'dd',
-                     '-B', 'd_ec_crm0' , # 'd_ec_crm1',
-                     '--tables', 't_crm_qq_record_201612', 't_crm_qq_record_201611', 't_crm_qq_record_201610', 't_crm_qq_record_201609',
-                     # 't_crm_qq_record_201608', 't_crm_qq_record_201607', 't_crm_qq_record_201606', 't_crm_qq_record_201509', 't_crm_qq_record_201610'
-                     ]
-                     # '-B', "d_ec_crm0", "d_ec_crm1", "--ignore-table=d_ec_crm0.t_crm_qq_record_201612",
-                     # '--ignore-table=d_ec_crm1.t_crm_qq_record_201611', '--ignore-table=d_ec_crm1.t_crm_qq_record_201610', '--ignore-table=d_ec_crm1.t_crm_qq_record_201608',
-                     # '--ignore-table', 'd_ec_crm0.t_crm_qq_record_201611', 'd_ec_crm0.t_crm_qq_record_201607']
-
     mycmd = sys.argv
     my_process = NewOptions(mycmd)  # just for args check
     my_process = None
 
-    # print mycmd
     # my_process = None
     if mycmd[1] == 'mysqldump':
         my_process = MyDump(mycmd)
